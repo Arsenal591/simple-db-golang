@@ -15,12 +15,14 @@ const (
 	pageSize = 4096
 )
 
+// todo: We simply assume that there will be only one header page in each file.
 type DiskManager struct {
 	fileName      string
 	header        *headerPageInfo
 	headerRawData []byte
 
-	fi *os.File
+	fi          *os.File
+	freePageSet map[common.PageId]struct{}
 }
 
 func NewDiskManager(fileName string) *DiskManager {
@@ -29,26 +31,32 @@ func NewDiskManager(fileName string) *DiskManager {
 		log.WithError(err).Fatalf("Cannot open file.")
 	}
 	dm := &DiskManager{
-		fileName: fileName,
-		fi:       fi,
+		fileName:      fileName,
+		fi:            fi,
+		headerRawData: directio.AlignedBlock(pageSize),
+		freePageSet:   make(map[common.PageId]struct{}),
 	}
 	size, err := dm.getFileSize()
 	if err != nil {
 		log.WithError(err).Fatalf("Cannot get file size.")
 	}
 	if size == 0 { // New file
-		dm.headerRawData = directio.AlignedBlock(pageSize)
 		dm.header = createHeaderPageInfo(dm.headerRawData)
 		dm.header.init()
 		if err := dm.writeHeaderPage(); err != nil {
 			log.WithError(err).Fatalf("Write header page failed.")
 		}
 	} else {
-		dm.headerRawData, err = dm.readPageData(common.PageId(0))
+		err = dm.readPageData(common.PageId(0), dm.headerRawData)
 		if err != nil {
 			log.WithError(err).Fatalf("Read header page failed.")
 		}
 		dm.header = createHeaderPageInfo(dm.headerRawData)
+
+		for i := int32(0); i < dm.header.numFreePages; i++ {
+			freePageId := dm.header.get(i)
+			dm.freePageSet[freePageId] = struct{}{}
+		}
 	}
 	return dm
 }
@@ -57,42 +65,60 @@ func (dm *DiskManager) Close() error {
 	return dm.fi.Close()
 }
 
-func (dm *DiskManager) AllocatePage() (common.PageId, []byte) {
+func (dm *DiskManager) AllocatePage() (common.PageId, error) {
 	var pageId common.PageId
 	var data []byte
 	var err error
 	if dm.header.hasFreePage() {
 		pageId = dm.header.popFreePage()
-		data, err = dm.readPageData(pageId)
-		if err != nil {
-			log.WithError(err).Fatalf("Read page failed.")
-		}
+		delete(dm.freePageSet, pageId)
 	} else {
 		pageId = dm.header.nextPageId
 		data = directio.AlignedBlock(pageSize)
 		if err = dm.writePageData(pageId, data); err != nil {
-			log.WithError(err).Fatalf("Create new page failed.")
+			log.WithError(err).Errorf("Create new page failed.")
+			return 0, err
 		}
 		dm.header.nextPageId++
 	}
 	if err = dm.writeHeaderPage(); err != nil {
 		log.WithError(err).Fatalf("Write header page failed.")
 	}
-	return pageId, data
+	return pageId, nil
 }
 
-func (dm *DiskManager) DeallocatePage(id common.PageId) {
+func (dm *DiskManager) DeallocatePage(id common.PageId) error {
+	if id >= dm.header.nextPageId {
+		return fmt.Errorf("Page %d is not in the file.", id)
+	}
+	if _, ok := dm.freePageSet[id]; ok {
+		return fmt.Errorf("Page %d is already deallocated.", id)
+	}
+	dm.freePageSet[id] = struct{}{}
 	dm.header.pushFreePage(id)
 	if err := dm.writeHeaderPage(); err != nil {
 		log.WithError(err).Fatalf("Write header page failed.")
 	}
+	return nil
 }
 
-func (dm *DiskManager) ReadPage(pageId common.PageId) ([]byte, error) {
-	return dm.readPageData(pageId)
+func (dm *DiskManager) ReadPage(pageId common.PageId, data []byte) error {
+	if pageId >= dm.header.nextPageId {
+		return fmt.Errorf("Page %d is not in the file.", pageId)
+	}
+	if _, ok := dm.freePageSet[pageId]; ok {
+		return fmt.Errorf("Page %d is already deallocated.", pageId)
+	}
+	return dm.readPageData(pageId, data)
 }
 
 func (dm *DiskManager) WritePage(pageId common.PageId, data []byte) error {
+	if pageId >= dm.header.nextPageId {
+		return fmt.Errorf("Page %d is not in the file.", pageId)
+	}
+	if _, ok := dm.freePageSet[pageId]; ok {
+		return fmt.Errorf("Page %d is already deallocated.", pageId)
+	}
 	return dm.writePageData(pageId, data)
 }
 
@@ -104,29 +130,28 @@ func (dm *DiskManager) getFileSize() (int64, error) {
 	return stat.Size(), nil
 }
 
-func (dm *DiskManager) readPageData(pageId common.PageId) ([]byte, error) {
+func (dm *DiskManager) readPageData(pageId common.PageId, data []byte) error {
 	if pageId < 0 {
-		return nil, fmt.Errorf("Page id is negative.")
+		return fmt.Errorf("Page id is negative.")
 	}
 	offset := pageId * pageSize
 	size, err := dm.getFileSize()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if int64(offset) >= size {
-		return nil, fmt.Errorf("Read past end of file.")
+		return fmt.Errorf("Read past end of file.")
 	}
 	if _, err := dm.fi.Seek(int64(offset), io.SeekStart); err != nil {
-		return nil, err
+		return err
 	}
-	data := directio.AlignedBlock(pageSize)
 	if n, err := dm.fi.Read(data); err != nil {
-		return nil, err
+		return err
 	} else {
 		if n < pageSize {
-			return nil, fmt.Errorf("Read less than a page.")
+			return fmt.Errorf("Read less than a page.")
 		}
-		return data, nil
+		return nil
 	}
 }
 

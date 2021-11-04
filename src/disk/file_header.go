@@ -7,6 +7,7 @@ import (
 	"simple-db-golang/src/common"
 )
 
+// todo: use bitmask instead of list of int32
 type headerPageInfo struct {
 	nextPageId   common.PageId
 	numFreePages int32
